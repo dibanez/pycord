@@ -210,6 +210,13 @@ class Sink(Filters):
         Audio may only be formatted after recording is finished.
     """
 
+    #: Event listeners consumed by the voice receive
+    #: :class:`~discord.voice.receive.router.SinkEventRouter`. Each entry is a
+    #: ``(event_name, method_name)`` tuple. Classic sinks deliver audio through
+    #: :meth:`write` and register no event listeners, so this defaults to an
+    #: empty list; subclasses that handle voice events may populate it.
+    __sink_listeners__: list[tuple[str, str]] = []
+
     def __init__(self, *, filters=None):
         if filters is None:
             filters = default_filters
@@ -222,18 +229,57 @@ class Sink(Filters):
     def client(self) -> VoiceClient | None:
         return self.vc
 
+    @property
+    def root(self) -> Sink:
+        """The root sink of this sink tree.
+
+        Classic sinks are standalone and have no parent, so this returns
+        ``self``. Provided for compatibility with the voice receive routers.
+        """
+        return self
+
+    def walk_children(self, with_self: bool = False):
+        """Yield the child sinks of this sink.
+
+        Classic sinks have no children. When ``with_self`` is ``True`` the
+        sink itself is yielded. Provided for compatibility with the voice
+        receive routers, which traverse the sink tree.
+        """
+        if with_self:
+            yield self
+
     def init(self, vc: VoiceClient):  # called under listen
         self.vc = vc
         super().init()
 
+    def is_opus(self) -> bool:
+        """Whether this sink wants raw Opus packets instead of decoded PCM.
+
+        The packet decoder calls this to decide whether to decode each packet.
+        Classic sinks (PCM, WAV, MP3, ...) all store decoded PCM, so this
+        returns ``False``. Subclasses doing raw Opus passthrough may override it.
+        """
+        return False
+
     @Filters.container
     def write(self, data, user):
-        if user not in self.audio_data:
-            file = io.BytesIO()
-            self.audio_data.update({user: AudioData(file)})
+        # The voice receive architecture delivers a :class:`~discord.voice.VoiceData`
+        # object (with ``.pcm``/``.opus`` and a ``.source`` user), not raw bytes.
+        # Classic sinks store the decoded PCM (or raw Opus for opus sinks). Raw
+        # bytes are still tolerated for backward compatibility / direct callers.
+        if isinstance(data, (bytes, bytearray, memoryview)):
+            audio = data
+        else:
+            audio = data.opus if self.is_opus() else data.pcm
 
-        file = self.audio_data[user]
-        file.write(data)
+        # Index by user id (int) — that is what consumers expect; ``user`` may be
+        # a Member/User/Object coming from VoiceData.source.
+        uid = getattr(user, "id", user)
+
+        if uid not in self.audio_data:
+            self.audio_data[uid] = AudioData(io.BytesIO())
+
+        self.audio_data[uid].write(audio)
 
     def cleanup(self):
         self.finished = True

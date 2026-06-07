@@ -98,6 +98,7 @@ class JitterBuffer(BaseBuff[PacketT]):
         self._has_item: threading.Event = threading.Event()
         # self._lock: threading.Lock = threading.Lock()
         self._buffer: list[Packet] = []
+        self.dropped: int = 0  # diagnostic: packets discarded (too old / overflow)
 
     def _push(self, packet: Packet) -> None:
         heapq.heappush(self._buffer, packet)
@@ -133,8 +134,15 @@ class JitterBuffer(BaseBuff[PacketT]):
             self._has_item.clear()
 
     def _cleanup(self) -> None:
-        while len(self._buffer) > self.max_size:
+        # When the buffer reaches max_size, _update_has_item flags it ready so
+        # the consumer drains it (delivering packets in order, advancing past a
+        # missing one). Discarding here at exactly max_size would instead throw
+        # away those front packets. Only drop as a safety valve far beyond
+        # max_size (e.g. a stalled consumer), to bound memory.
+        hard_cap = self.max_size * 8
+        while len(self._buffer) > hard_cap:
             heapq.heappop(self._buffer)
+            self.dropped += 1
 
     def push(self, packet: Packet) -> bool:
         seq = packet.sequence
@@ -143,6 +151,7 @@ class JitterBuffer(BaseBuff[PacketT]):
             gap_wrapped(self._last_tx_seq, seq) > self._threshold
             and self._last_tx_seq != -1
         ):
+            self.dropped += 1
             _log.debug("Dropping old packet %s", packet)
             return False
 

@@ -756,6 +756,13 @@ class VoiceClient(VoiceProtocol):
                 "'sync_start' parameter is deprecated since 2.7 and will be removed in 3.0"
             )
 
+        # Bind the sink to this voice client. The packet decoder relies on
+        # `sink.client` (i.e. the VoiceClient) to resolve users, read the
+        # ssrc->user map and the DAVE session; without this it is None and
+        # decoding the first packet fails (`assert self.sink.client`),
+        # silently aborting the recording.
+        sink.init(self)
+
         self._reader = AudioReader(sink, self, after=callback, start=True)
 
     start_listening = start_recording

@@ -146,6 +146,35 @@ class AudioReader:
         self.speaking_timer.stop()
         self.keep_alive.stop()
 
+        # Diagnostic summary of the recording: how packets fared end to end.
+        try:
+            jitter_dropped = sum(
+                dec._buffer.dropped
+                for dec in self.packet_router.decoders.values()
+            )
+            s = self.decryptor.stats
+            # print() because the `discord` logger has a NullHandler, so
+            # _log.warning would be swallowed without explicit logging config.
+            print(
+                "[voice-recv] Recording stats: "
+                f"rtp={s['rtp']} dave_ok={s['dave_ok']} dave_fail={s['dave_fail']} "
+                f"no_uid={s['no_uid']} dave_off={s['dave_off']} | "
+                f"written={self.packet_router.written} "
+                f"decode_errors={self.packet_router.decode_errors} "
+                f"jitter_dropped={jitter_dropped}",
+                flush=True,
+            )
+        except Exception:
+            _log.debug("Could not build recording stats", exc_info=True)
+
+        # Finalize every sink (e.g. write WAV headers, format audio) before the
+        # after callback runs, so the callback receives fully written audio.
+        for sink in self.sink.root.walk_children(with_self=True):
+            try:
+                sink.cleanup()
+            except Exception as exc:
+                _log.exception("Error calling cleanup() for %s", sink, exc_info=exc)
+
         if self.after:
             try:
                 self.after(self.error)
@@ -153,12 +182,6 @@ class AudioReader:
                 _log.exception(
                     "An error ocurred while calling the after callback on audio reader"
                 )
-
-        """for sink in self.sink.root.walk_children(with_self=True):
-            try:
-                sink.cleanup()
-            except Exception as exc:
-                _log.exception("Error calling cleanup() for %s", sink, exc_info=exc)"""
 
     def set_sink(self, sink: Sink) -> Sink:
         old_sink = self.sink
@@ -257,6 +280,15 @@ class PacketDecryptor:
         self.mode: SupportedModes = mode
         self.client: VoiceClient = client
 
+        # Diagnostic counters (see AudioReader._stop for the summary log).
+        self.stats: dict[str, int] = {
+            "rtp": 0,        # total RTP packets seen
+            "dave_ok": 0,    # DAVE-decrypted successfully
+            "dave_fail": 0,  # DAVE decrypt raised -> replaced with silence
+            "no_uid": 0,     # DAVE ready but ssrc not yet mapped to a user
+            "dave_off": 0,   # no DAVE session / not ready (transport-only)
+        }
+
         try:
             self._decryptor_rtp: DecryptRTP = getattr(self, "_decrypt_rtp_" + mode)
             self._decryptor_rtcp: DecryptRTCP = getattr(self, "_decrypt_rtcp_" + mode)
@@ -291,30 +323,33 @@ class PacketDecryptor:
         state = self.client._connection
         dave = state.dave_session
 
-        raw_payload = self._decryptor_rtp(packet)
+        self.stats["rtp"] += 1
 
+        # Transport decryption; this already strips the RTP extension header (if
+        # any), so `payload` is the Opus frame — DAVE-encrypted when E2EE is on.
+        payload = self._decryptor_rtp(packet)
+
+        # DAVE (E2EE) layer: the Opus payload is encrypted end-to-end on top of
+        # the transport encryption. Strip it here, before Opus decoding.
         if dave is not None and dave.ready:
             uid = state.ssrc_user_map.get(packet.ssrc)
             if uid:
                 try:
-                    decrypted_audio = dave.decrypt(
-                        uid,
-                        davey.MediaType.audio,
-                        raw_payload,
-                    )
-
-                    if packet.extended:
-                        offset = packet.update_extended_header(decrypted_audio)
-                        packet.decrypted_data = decrypted_audio[offset:]
-                    else:
-                        packet.decrypted_data = decrypted_audio
+                    payload = dave.decrypt(uid, davey.MediaType.audio, payload)
+                    self.stats["dave_ok"] += 1
                 except Exception as exc:
+                    self.stats["dave_fail"] += 1
                     _log.debug(
                         "Ignoring exception while decoding DAVE packet", exc_info=exc
                     )
-                    packet.decrypted_data = OPUS_SILENCE
+                    payload = OPUS_SILENCE
+            else:
+                self.stats["no_uid"] += 1
+        else:
+            self.stats["dave_off"] += 1
 
-        return packet.decrypted_data
+        packet.decrypted_data = payload
+        return payload
 
     def decrypt_rtcp(self, packet: bytes) -> bytes:
         data = self._decryptor_rtcp(packet)
@@ -424,10 +459,16 @@ class PacketDecryptor:
             _log.error("Critical error at AEAD: %s", exc)
             raise CryptoError(exc)
 
+        # The decrypted plaintext is the (DAVE-encrypted) Opus payload. Only an
+        # RTP extension header may precede it, and only when packet.extended is
+        # set: strip exactly that, like the other transport decryptors do.
+        # (The previous hardcoded result[8:] corrupted non-extended packets,
+        # turning the recorded audio into noise.)
         if packet.extended:
-            packet.update_extended_header(result)
+            offset = packet.update_extended_header(result)
+            result = result[offset:]
 
-        return result[8:]
+        return result
 
     def _decrypt_rtcp_aead_xchacha20_poly1305_rtpsize(self, data: bytes) -> bytes:
         _log.debug("Decrypting RTCP AEAD XChaCha20 Poly1305 RTPSize")

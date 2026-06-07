@@ -64,6 +64,10 @@ class PacketRouter(threading.Thread):
         self._end_thread: threading.Event = threading.Event()
         self._dropped_ssrcs: deque[int] = deque(maxlen=16)
 
+        # Diagnostic counters (see AudioReader._stop for the summary log).
+        self.written: int = 0        # frames delivered to the sink
+        self.decode_errors: int = 0  # packets skipped due to decode/processing error
+
     def feed_rtp(self, packet: RTPPacket) -> None:
         if packet.ssrc in self._dropped_ssrcs:
             _log.debug("Ignoring packet from dropped ssrc %s", packet.ssrc)
@@ -121,7 +125,14 @@ class PacketRouter(threading.Thread):
             _log.exception("Error in %s loop", self)
             self.reader.error = exc
         finally:
-            self.reader.client.stop_recording()
+            # Only stop if the router died on its own; if recording was already
+            # stopped externally (e.g. via stop_recording), calling it again
+            # raises "You are not recording".
+            try:
+                if self.reader.client.is_recording():
+                    self.reader.client.stop_recording()
+            except Exception:
+                _log.debug("Ignoring error stopping recording from router", exc_info=True)
             self.waiter.clear()
 
     def _do_run(self) -> None:
@@ -130,9 +141,25 @@ class PacketRouter(threading.Thread):
 
             with self._lock:
                 for decoder in self.waiter.items:
-                    data = decoder.pop_data()
+                    # A single malformed packet (e.g. an Opus decode error,
+                    # "corrupted stream") must not abort the whole recording:
+                    # log it and move on so the rest of the audio is captured.
+                    try:
+                        data = decoder.pop_data()
+                    except Exception:
+                        self.decode_errors += 1
+                        _log.warning(
+                            "Skipping packet for ssrc %s: failed to decode/process",
+                            getattr(decoder, "ssrc", "?"),
+                            exc_info=True,
+                        )
+                        continue
                     if data is not None:
-                        self.sink.write(data, data.source)
+                        try:
+                            self.sink.write(data, data.source)
+                            self.written += 1
+                        except Exception:
+                            _log.exception("Error writing decoded audio to sink")
 
 
 class SinkEventRouter(threading.Thread):

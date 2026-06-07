@@ -582,7 +582,11 @@ class PacketDecoder:
 
         from discord.voice.utils.buffer import JitterBuffer
 
-        self._buffer: JitterBuffer = JitterBuffer()
+        # Recording is not latency-sensitive like live playback: use a large
+        # buffer so reordered/bursty packets are kept and delivered in order
+        # instead of being dropped (the default max_size=10 discarded ~a third
+        # of packets, causing choppy audio).
+        self._buffer: JitterBuffer = JitterBuffer(max_size=512)
         self._cached_id: int | None = None
 
         self._last_seq: int = -1
@@ -725,9 +729,9 @@ class PacketDecoder:
             else:
                 pcm = self._decoder.decode(None, fec=False)
 
-        if HAS_DAVEY:
-            if user_id is not None and in_dave and dave.can_passthrough(user_id):
-                _log.debug("User ID %s can passthrough, decrypting with DAVE", user_id)
-                pcm = dave.decrypt(user_id, davey.MediaType.audio, pcm)
+        # NOTE: DAVE (E2EE) decryption is performed on the *Opus* payload before
+        # decoding (see PacketDecryptor.decrypt_rtp in voice/receive/reader.py).
+        # Running dave.decrypt() again here on the already-decoded PCM corrupted
+        # the audio into noise, so it must not be done.
 
         return packet, pcm
